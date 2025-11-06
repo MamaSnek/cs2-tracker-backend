@@ -13,16 +13,16 @@ from fastapi import FastAPI, HTTPException, Query
 
 # ======= SIMPLE CONFIG =======
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11dto0ons9kgBaRH8M2thH1dKaeeVaigprFmgSuurvIo")
-SHEET_GID = os.getenv("SHEET_GID", "0")  # your sheet URL shows gid=0
+SHEET_GID = os.getenv("SHEET_GID", "0")
 STEAM_APPID = int(os.getenv("STEAM_APPID", "730"))
-STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD for Steam community endpoints
-SKINPORT_CURRENCY = os.getenv("SKINPORT_CURRENCY", "CAD")         # SkinPort uses currency text like CAD, USD, EUR
+STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD
+SKINPORT_CURRENCY = os.getenv("SKINPORT_CURRENCY", "CAD")          # CAD / USD / EUR
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
-USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.3 (+render)")
+USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.4 (+render)")
 
-# CSV endpoints (gviz first, then export)
+# CSV endpoints
 CSV_URLS = [
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&gid={SHEET_GID}",
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}",
@@ -90,37 +90,42 @@ def normalize_name(s: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t
 
-# ======= SHEET READER =======
-async def fetch_sheet_csv_text() -> str:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
-        "Referer": f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid={SHEET_GID}",
-    }
-    async with httpx.AsyncClient(headers=headers) as client:
-        last_status = None
-        last_error = None
-        for url in CSV_URLS:
-            try:
-                r = await client.get(url, timeout=20, follow_redirects=True)
-                last_status = r.status_code
-                if r.status_code == 200 and r.text and "," in r.text.splitlines()[0]:
-                    return r.text
-            except Exception as e:
-                last_error = str(e)
-        detail = f"Unable to fetch sheet CSV"
-        if last_status:
-            detail += f" (HTTP {last_status})"
-        if last_error:
-            detail += f" - {last_error}"
-        raise HTTPException(status_code=502, detail=detail)
+# ======= ONE SHARED HTTP CLIENT (HTTP/2) =======
+def make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        http2=True,
+        headers={
+            "User-Agent": USER_AGENT,
+        },
+        timeout=30.0,
+        follow_redirects=True,
+    )
 
-async def read_items_from_sheet() -> List[Dict[str, Any]]:
+# ======= SHEET READER =======
+async def fetch_sheet_csv_text(client: httpx.AsyncClient) -> str:
+    last_status = None
+    last_error = None
+    for url in CSV_URLS:
+        try:
+            r = await client.get(url)
+            last_status = r.status_code
+            if r.status_code == 200 and r.text and "," in r.text.splitlines()[0]:
+                return r.text
+        except Exception as e:
+            last_error = str(e)
+    detail = f"Unable to fetch sheet CSV"
+    if last_status:
+        detail += f" (HTTP {last_status})"
+    if last_error:
+        detail += f" - {last_error}"
+    raise HTTPException(status_code=502, detail=detail)
+
+async def read_items_from_sheet(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     cached = cache_get("sheet_rows")
     if cached is not None:
         return cached
 
-    text = await fetch_sheet_csv_text()
+    text = await fetch_sheet_csv_text(client)
     f = io.StringIO(text)
     reader = csv.DictReader(f)
 
@@ -157,7 +162,6 @@ async def read_items_from_sheet() -> List[Dict[str, Any]]:
 # ======= PRICE FETCHERS =======
 async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) -> Optional[float]:
     name = normalize_name(market_hash_name)
-    url = "https://steamcommunity.com/market/priceoverview/"
     params = {
         "appid": str(STEAM_APPID),
         "market_hash_name": name,
@@ -165,7 +169,7 @@ async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) ->
         "format": "json"
     }
     try:
-        r = await client.get(url, params=params, timeout=15)
+        r = await client.get("https://steamcommunity.com/market/priceoverview/", params=params)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -176,11 +180,10 @@ async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) ->
     except Exception:
         return None
 
-# SkinPort requires 'Accept-Encoding: br' (Brotli). We set it here and installed 'brotli' in requirements.txt.
 SKINPORT_HEADERS = {
-    "User-Agent": USER_AGENT,
     "Accept": "application/json",
-    "Accept-Encoding": "br",
+    "Accept-Encoding": "gzip, deflate, br",
+    "User-Agent": USER_AGENT,
 }
 
 async def fetch_skinport_catalog(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
@@ -189,17 +192,24 @@ async def fetch_skinport_catalog(client: httpx.AsyncClient) -> List[Dict[str, An
         return cached
 
     params = {"app_id": STEAM_APPID, "currency": SKINPORT_CURRENCY, "tradable": 1}
-    try:
-        r = await client.get("https://api.skinport.com/v1/items", params=params, headers=SKINPORT_HEADERS, timeout=30)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-        cache_set("skinport_catalog", data, ttl=3600)  # 1 hour
-        return data
-    except Exception:
-        return []
+
+    # small retry loop for 502s
+    for attempt in range(3):
+        try:
+            r = await client.get("https://api.skinport.com/v1/items", params=params, headers=SKINPORT_HEADERS)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    cache_set("skinport_catalog", data, ttl=3600)  # 1 hour
+                    return data
+            # transient 5xx → brief backoff
+            if 500 <= r.status_code < 600:
+                await asyncio.sleep(0.8 * (attempt + 1))
+            else:
+                break
+        except Exception:
+            await asyncio.sleep(0.8 * (attempt + 1))
+    return []
 
 def best_skinport_match(catalog: List[Dict[str, Any]], target_name: str) -> Optional[Dict[str, Any]]:
     t = normalize_name(target_name).lower()
@@ -274,12 +284,12 @@ def health():
 
 @app.get("/prices")
 async def get_prices():
-    items = await read_items_from_sheet()
-    if not items:
-        raise HTTPException(status_code=400, detail="No items found in sheet")
-
     sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+    async with make_client() as client:
+        items = await read_items_from_sheet(client)
+        if not items:
+            raise HTTPException(status_code=400, detail="No items found in sheet")
+
         tasks = [fetch_price_for_item(client, it, sem) for it in items]
         results_raw = await asyncio.gather(*tasks)
 
@@ -314,12 +324,12 @@ async def get_prices():
 # ======= DEBUG ENDPOINTS =======
 @app.get("/test_steam")
 async def test_steam(name: str = Query(..., description="Exact market name, e.g. 'Gamma 2 Case'")):
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+    async with make_client() as client:
         price = await fetch_steam_price(client, name)
         return {"name": name, "price": price, "currency_code": STEAM_CURRENCY_CODE}
 
 @app.get("/test_skinport")
 async def test_skinport(name: str = Query(..., description="Exact market name")):
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+    async with make_client() as client:
         price = await fetch_skinport_price(client, name)
         return {"name": name, "price": price, "currency": SKINPORT_CURRENCY}
