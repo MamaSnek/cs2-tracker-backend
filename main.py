@@ -12,18 +12,29 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 # ======= SIMPLE CONFIG =======
-# You already shared your sheet ID and your tab is gid=0.
-# We will use GID directly so Google redirects don't break things.
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11dto0ons9kgBaRH8M2thH1dKaeeVaigprFmgSuurvIo")
-SHEET_GID = os.getenv("SHEET_GID", "0")   # your URL shows gid=0
+SHEET_GID = os.getenv("SHEET_GID", "0")  # your URL shows gid=0
 STEAM_APPID = int(os.getenv("STEAM_APPID", "730"))
-STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD for community endpoints
+STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD (Steam community endpoints)
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
-USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.0")
-# Build a stable CSV export URL using gid (more reliable than sheet=)
-CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.1 (+render)")
+
+# Try multiple CSV endpoints to dodge redirects/quirks
+CSV_URLS = [
+    # 1) gviz CSV (usually robust)
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&gid={SHEET_GID}",
+    # 2) export CSV (older method)
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}",
+    # 3) publish CSV (works if you later do File -> Share -> Publish to the web)
+    # If you ever publish, replace <PUB_ID> with the long publish ID Google gives you.
+    # We'll leave this pattern here as a final fallback (won't be used unless you set env var PUBLISHED_CSV_URL).
+]
+
+PUBLISHED_CSV_URL = os.getenv("PUBLISHED_CSV_URL")  # optional direct publish URL
+if PUBLISHED_CSV_URL:
+    CSV_URLS.append(PUBLISHED_CSV_URL)
 
 # ======= IN-MEMORY CACHE =======
 _CACHE: Dict[str, Any] = {}
@@ -66,7 +77,7 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
     if num.count(",") and num.count("."):
         num = num.replace(",", "")
     elif num.count(",") and not num.count("."):
-        # heuristic for locales "0,75" etc.
+        # heuristic for locales "0,75"
         if len(num.split(",")[-1]) == 3:
             num = num.replace(",", "")
         else:
@@ -76,25 +87,48 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
     except:
         return None
 
-# ======= READ ITEMS FROM SHEET (CSV via gid) =======
+async def fetch_sheet_csv_text() -> str:
+    """
+    Try multiple CSV endpoints with redirects allowed.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
+        "Referer": f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid={SHEET_GID}",
+    }
+    async with httpx.AsyncClient(headers=headers) as client:
+        last_status = None
+        last_error = None
+        for url in CSV_URLS:
+            try:
+                r = await client.get(url, timeout=20, follow_redirects=True)
+                last_status = r.status_code
+                if r.status_code == 200 and r.text and "," in r.text.splitlines()[0]:
+                    return r.text
+            except Exception as e:
+                last_error = str(e)
+        # If we reach here, nothing worked
+        detail = f"Unable to fetch sheet CSV"
+        if last_status:
+            detail += f" (HTTP {last_status})"
+        if last_error:
+            detail += f" - {last_error}"
+        raise HTTPException(status_code=502, detail=detail)
+
+# ======= READ ITEMS FROM SHEET =======
 async def read_items_from_sheet() -> List[Dict[str, Any]]:
     cached = cache_get("sheet_rows")
     if cached is not None:
         return cached
 
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
-        r = await client.get(CSV_EXPORT_URL, timeout=20, follow_redirects=True)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Unable to fetch sheet CSV (HTTP {r.status_code})")
-        text = r.text
+    text = await fetch_sheet_csv_text()
 
     f = io.StringIO(text)
     reader = csv.DictReader(f)
 
-    # We expect headers EXACTLY: item_name, source, paid_price, quantity
+    # Expect headers: item_name, source, paid_price, quantity
     rows = []
     for row in reader:
-        # normalize keys safely
         norm = {}
         for k, v in row.items():
             if k is None:
@@ -118,11 +152,9 @@ async def read_items_from_sheet() -> List[Dict[str, Any]]:
         })
 
     if not rows:
-        # Surface a clear error so you know it's a header or tab issue
         raise HTTPException(status_code=400, detail="No items found in sheet (check headers & tab)")
 
-    # small cache for the sheet (1 minute)
-    cache_set("sheet_rows", rows, ttl=60)
+    cache_set("sheet_rows", rows, ttl=60)  # cache sheet content 1 minute
     return rows
 
 # ======= PRICE FETCHERS =======
@@ -147,9 +179,7 @@ async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) ->
         return None
 
 async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional[float]:
-    # Try SkinPort items search endpoint(s)
     try:
-        # primary
         r = await client.get(
             "https://api.skinport.com/v1/items",
             params={"appid": STEAM_APPID, "term": name},
@@ -158,9 +188,8 @@ async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional
         data = r.json() if r.status_code == 200 else None
 
         if not data:
-            # fallback query param variant
             r2 = await client.get(
-                f"https://api.skinport.com/v1/items",
+                "https://api.skinport.com/v1/items",
                 params={"appid": STEAM_APPID, "query": name},
                 timeout=15
             )
@@ -170,14 +199,12 @@ async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional
             return None
 
         if isinstance(data, list) and data:
-            # exact match first
             for item in data:
                 n = (item.get("name") or item.get("market_hash_name") or "").strip().lower()
                 if n == name.strip().lower():
                     p = item.get("price") or item.get("market_price") or item.get("last_price")
                     if p is not None:
                         return float(p)
-            # otherwise first result
             first = data[0]
             p = first.get("price") or first.get("market_price") or first.get("last_price")
             if p is not None:
@@ -200,7 +227,6 @@ async def fetch_price_for_item(client: httpx.AsyncClient, item: Dict[str, Any], 
     cache_key = f"price::{source}::{name}"
     cached = cache_get(cache_key)
     if cached is not None:
-        # attach paid and qty
         cached_copy = dict(cached)
         cached_copy["paid_price"] = item.get("paid_price")
         cached_copy["quantity"] = item.get("quantity", 1)
@@ -243,34 +269,4 @@ async def get_prices():
         raise HTTPException(status_code=400, detail="No items found in sheet")
 
     sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
-    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
-        tasks = [fetch_price_for_item(client, it, sem) for it in items]
-        results_raw = await asyncio.gather(*tasks)
-
-    output = []
-    for r in results_raw:
-        current = r.get("current_price")
-        paid = r.get("paid_price") or 0.0
-        qty = int(r.get("quantity") or 1)
-        profit_per = None
-        total_profit = None
-        pct = None
-        if current is not None:
-            try:
-                profit_per = round(float(current) - float(paid), 2)
-                total_profit = round(profit_per * qty, 2)
-                pct = round((profit_per / float(paid)) * 100, 2) if paid and float(paid) != 0 else None
-            except Exception:
-                pass
-        output.append({
-            "item_name": r.get("item_name"),
-            "source": r.get("source"),
-            "paid_price": paid,
-            "current_price": round(current, 2) if current is not None else None,
-            "quantity": qty,
-            "profit_per_item": profit_per,
-            "profit_total": total_profit,
-            "percent_change": pct,
-            "timestamp_utc": r.get("timestamp_utc"),
-        })
-    return output
+    async with httpx.AsyncClient(headers={"User-Agent":
