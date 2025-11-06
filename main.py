@@ -86,7 +86,7 @@ async def read_items_from_sheet() -> List[Dict[str, Any]]:
         return cached
 
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
-        r = await client.get(CSV_EXPORT_URL, timeout=15)
+       r = await client.get(CSV_EXPORT_URL, timeout=15, follow_redirects=True)
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Unable to fetch sheet CSV (HTTP {r.status_code})")
         text = r.text
