@@ -11,24 +11,21 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 
-# ---------- Config (env vars)
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # REQUIRED
-SHEET_NAME = os.getenv("SHEET_NAME", "items")
+# ======= SIMPLE CONFIG =======
+# You already shared your sheet ID and your tab is gid=0.
+# We will use GID directly so Google redirects don't break things.
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11dto0ons9kgBaRH8M2thH1dKaeeVaigprFmgSuurvIo")
+SHEET_GID = os.getenv("SHEET_GID", "0")   # your URL shows gid=0
 STEAM_APPID = int(os.getenv("STEAM_APPID", "730"))
-STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 = CAD
-SKINPORT_API_BASE = os.getenv("SKINPORT_API_BASE", "https://api.skinport.com/v1")
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # default 6 hours
+STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD for community endpoints
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
 USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.0")
+# Build a stable CSV export URL using gid (more reliable than sheet=)
+CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}"
 
-if not GOOGLE_SHEET_ID:
-    raise RuntimeError("Please set the environment variable GOOGLE_SHEET_ID")
-
-# Build public CSV export URL for the sheet/tab (works when sheet is public "anyone with link can view")
-CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&sheet={SHEET_NAME}"
-
-# ---------- Simple in-memory cache
+# ======= IN-MEMORY CACHE =======
 _CACHE: Dict[str, Any] = {}
 _CACHE_EXPIRES: Dict[str, float] = {}
 
@@ -45,7 +42,7 @@ def cache_set(key: str, value: Any, ttl: int = CACHE_TTL_SECONDS):
     _CACHE[key] = value
     _CACHE_EXPIRES[key] = time.time() + ttl
 
-# ---------- Helpers
+# ======= HELPERS =======
 def parse_float_safe(v) -> Optional[float]:
     try:
         return float(str(v).replace(",", "").strip())
@@ -69,7 +66,7 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
     if num.count(",") and num.count("."):
         num = num.replace(",", "")
     elif num.count(",") and not num.count("."):
-        # heuristic
+        # heuristic for locales "0,75" etc.
         if len(num.split(",")[-1]) == 3:
             num = num.replace(",", "")
         else:
@@ -79,46 +76,56 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
     except:
         return None
 
-# ---------- Read items from the public Google Sheet CSV
+# ======= READ ITEMS FROM SHEET (CSV via gid) =======
 async def read_items_from_sheet() -> List[Dict[str, Any]]:
     cached = cache_get("sheet_rows")
     if cached is not None:
         return cached
 
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
-       r = await client.get(CSV_EXPORT_URL, timeout=15, follow_redirects=True)
+        r = await client.get(CSV_EXPORT_URL, timeout=20, follow_redirects=True)
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Unable to fetch sheet CSV (HTTP {r.status_code})")
         text = r.text
 
     f = io.StringIO(text)
     reader = csv.DictReader(f)
+
+    # We expect headers EXACTLY: item_name, source, paid_price, quantity
     rows = []
     for row in reader:
-        # Normalize header keys to lowercase no-space
+        # normalize keys safely
         norm = {}
         for k, v in row.items():
             if k is None:
                 continue
             key = k.strip().lower().replace(" ", "_")
             norm[key] = v.strip() if isinstance(v, str) else v
-        # required: item_name, source, paid_price, quantity
+
         item_name = norm.get("item_name")
         source = (norm.get("source") or "steam").strip().lower()
-        paid_price = parse_float_safe(norm.get("paid_price") or norm.get("paid") or 0)
+        paid_price = parse_float_safe(norm.get("paid_price") or 0)
         quantity = parse_quantity(norm.get("quantity") or 1)
+
         if not item_name:
             continue
+
         rows.append({
             "item_name": item_name,
             "source": source,
             "paid_price": paid_price,
             "quantity": quantity,
         })
-    cache_set("sheet_rows", rows, ttl=60)  # small cache for sheet reading
+
+    if not rows:
+        # Surface a clear error so you know it's a header or tab issue
+        raise HTTPException(status_code=400, detail="No items found in sheet (check headers & tab)")
+
+    # small cache for the sheet (1 minute)
+    cache_set("sheet_rows", rows, ttl=60)
     return rows
 
-# ---------- Fetch prices
+# ======= PRICE FETCHERS =======
 async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) -> Optional[float]:
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {
@@ -140,36 +147,42 @@ async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) ->
         return None
 
 async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional[float]:
-    # Try SkinPort items search endpoint
+    # Try SkinPort items search endpoint(s)
     try:
-        url = f"{SKINPORT_API_BASE}/items"
-        params = {"appid": STEAM_APPID, "term": name}
-        r = await client.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-        else:
-            # fallback attempt
-            r2 = await client.get(f"{SKINPORT_API_BASE}/items?appid={STEAM_APPID}&query={name}", timeout=15)
-            if r2.status_code != 200:
-                return None
-            data = r2.json()
+        # primary
+        r = await client.get(
+            "https://api.skinport.com/v1/items",
+            params={"appid": STEAM_APPID, "term": name},
+            timeout=15
+        )
+        data = r.json() if r.status_code == 200 else None
 
-        # data usually list of items
+        if not data:
+            # fallback query param variant
+            r2 = await client.get(
+                f"https://api.skinport.com/v1/items",
+                params={"appid": STEAM_APPID, "query": name},
+                timeout=15
+            )
+            data = r2.json() if r2.status_code == 200 else None
+
+        if not data:
+            return None
+
         if isinstance(data, list) and data:
-            # try exact match
+            # exact match first
             for item in data:
                 n = (item.get("name") or item.get("market_hash_name") or "").strip().lower()
                 if n == name.strip().lower():
                     p = item.get("price") or item.get("market_price") or item.get("last_price")
                     if p is not None:
                         return float(p)
-            # fallback: first result
+            # otherwise first result
             first = data[0]
             p = first.get("price") or first.get("market_price") or first.get("last_price")
             if p is not None:
                 return float(p)
         elif isinstance(data, dict):
-            # sometimes wrapped
             items = data.get("items") or data.get("results") or []
             if items and isinstance(items, list):
                 first = items[0]
@@ -183,10 +196,11 @@ async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional
 async def fetch_price_for_item(client: httpx.AsyncClient, item: Dict[str, Any], sem: asyncio.Semaphore):
     name = item["item_name"]
     source = item.get("source", "steam")
+
     cache_key = f"price::{source}::{name}"
     cached = cache_get(cache_key)
     if cached is not None:
-        # attach paid and qty and return
+        # attach paid and qty
         cached_copy = dict(cached)
         cached_copy["paid_price"] = item.get("paid_price")
         cached_copy["quantity"] = item.get("quantity", 1)
@@ -215,7 +229,7 @@ async def fetch_price_for_item(client: httpx.AsyncClient, item: Dict[str, Any], 
     result["quantity"] = item.get("quantity", 1)
     return result
 
-# ---------- FastAPI app
+# ======= FASTAPI APP =======
 app = FastAPI(title="CS2 Portfolio Tracker Backend")
 
 @app.get("/health")
