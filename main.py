@@ -13,22 +13,21 @@ from fastapi import FastAPI, HTTPException, Query
 
 # ======= SIMPLE CONFIG =======
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "11dto0ons9kgBaRH8M2thH1dKaeeVaigprFmgSuurvIo")
-SHEET_GID = os.getenv("SHEET_GID", "0")  # your URL shows gid=0
+SHEET_GID = os.getenv("SHEET_GID", "0")  # your sheet URL shows gid=0
 STEAM_APPID = int(os.getenv("STEAM_APPID", "730"))
 STEAM_CURRENCY_CODE = int(os.getenv("STEAM_CURRENCY_CODE", "20"))  # 20 ~ CAD for Steam community endpoints
-SKINPORT_CURRENCY = os.getenv("SKINPORT_CURRENCY", "CAD")  # SkinPort expects a TEXT currency like CAD, USD, EUR
+SKINPORT_CURRENCY = os.getenv("SKINPORT_CURRENCY", "CAD")         # SkinPort uses currency text like CAD, USD, EUR
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
-USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.2 (+render)")
+USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.3 (+render)")
 
-# CSV endpoints (we'll use gviz form first)
+# CSV endpoints (gviz first, then export)
 CSV_URLS = [
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&gid={SHEET_GID}",
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={SHEET_GID}",
 ]
-
-PUBLISHED_CSV_URL = os.getenv("PUBLISHED_CSV_URL")  # optional publish-to-web CSV URL
+PUBLISHED_CSV_URL = os.getenv("PUBLISHED_CSV_URL")
 if PUBLISHED_CSV_URL:
     CSV_URLS.append(PUBLISHED_CSV_URL)
 
@@ -73,7 +72,6 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
     if num.count(",") and num.count("."):
         num = num.replace(",", "")
     elif num.count(",") and not num.count("."):
-        # heuristic for locales "0,75"
         if len(num.split(",")[-1]) == 3:
             num = num.replace(",", "")
         else:
@@ -84,15 +82,11 @@ def extract_number_from_price_str(s: str) -> Optional[float]:
         return None
 
 def normalize_name(s: str) -> str:
-    """Basic normalization to help match names between services."""
     if not s:
         return ""
     t = s.strip()
-    # common fixes: "Stat-Trak" -> "StatTrak™"
     t = re.sub(r"\bstat[-\s]?trak\b", "StatTrak™", t, flags=re.I)
-    # "Field Tested" -> "Field-Tested"
     t = re.sub(r"\bfield\s*tested\b", "Field-Tested", t, flags=re.I)
-    # squeeze spaces
     t = re.sub(r"\s+", " ", t)
     return t
 
@@ -162,7 +156,6 @@ async def read_items_from_sheet() -> List[Dict[str, Any]]:
 
 # ======= PRICE FETCHERS =======
 async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) -> Optional[float]:
-    """Use Steam community priceoverview (requires exact market_hash_name)."""
     name = normalize_name(market_hash_name)
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {
@@ -183,42 +176,38 @@ async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) ->
     except Exception:
         return None
 
+# SkinPort requires 'Accept-Encoding: br' (Brotli). We set it here and installed 'brotli' in requirements.txt.
+SKINPORT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Accept-Encoding": "br",
+}
+
 async def fetch_skinport_catalog(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    """
-    SkinPort API allows: app_id, currency, tradable (not 'appid' or 'term').
-    We'll fetch the whole catalog for app_id=730 and SKINPORT_CURRENCY, then cache it.
-    """
     cached = cache_get("skinport_catalog")
     if cached is not None:
         return cached
 
     params = {"app_id": STEAM_APPID, "currency": SKINPORT_CURRENCY, "tradable": 1}
     try:
-        r = await client.get("https://api.skinport.com/v1/items", params=params, timeout=30)
+        r = await client.get("https://api.skinport.com/v1/items", params=params, headers=SKINPORT_HEADERS, timeout=30)
         if r.status_code != 200:
             return []
         data = r.json()
         if not isinstance(data, list):
             return []
-        cache_set("skinport_catalog", data, ttl=3600)  # cache catalog 1 hour
+        cache_set("skinport_catalog", data, ttl=3600)  # 1 hour
         return data
     except Exception:
         return []
 
 def best_skinport_match(catalog: List[Dict[str, Any]], target_name: str) -> Optional[Dict[str, Any]]:
-    """
-    Try to match by exact lowercased 'market_hash_name' or 'name'.
-    """
     t = normalize_name(target_name).lower()
-
-    # First pass: exact matches
     for item in catalog:
         name1 = normalize_name(item.get("market_hash_name") or "").lower()
         name2 = normalize_name(item.get("name") or "").lower()
         if t == name1 or t == name2:
             return item
-
-    # Second pass: loose contains (fallback)
     for item in catalog:
         name1 = normalize_name(item.get("market_hash_name") or "").lower()
         name2 = normalize_name(item.get("name") or "").lower()
@@ -233,8 +222,7 @@ async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional
     match = best_skinport_match(catalog, name)
     if not match:
         return None
-    # SkinPort schema commonly uses one of these price keys
-    for k in ("price", "market_price", "last_price", "min_price"):
+    for k in ("price", "min_price", "market_price", "last_price", "mean_price", "median_price", "suggested_price"):
         if match.get(k) is not None:
             try:
                 return float(match[k])
@@ -323,7 +311,7 @@ async def get_prices():
         })
     return output
 
-# ======= DEBUG ENDPOINTS (to test from the server) =======
+# ======= DEBUG ENDPOINTS =======
 @app.get("/test_steam")
 async def test_steam(name: str = Query(..., description="Exact market name, e.g. 'Gamma 2 Case'")):
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
