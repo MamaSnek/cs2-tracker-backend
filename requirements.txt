@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
-httpx
+httpx[http2]
 python-dotenv
 brotli
