@@ -6,7 +6,7 @@ import csv
 import io
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -20,7 +20,7 @@ SKINPORT_CURRENCY = os.getenv("SKINPORT_CURRENCY", "CAD")          # CAD / USD /
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))
-USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.4 (+render)")
+USER_AGENT = os.getenv("USER_AGENT", "cs2-tracker-backend/1.5 (+render)")
 
 # CSV endpoints
 CSV_URLS = [
@@ -85,10 +85,23 @@ def normalize_name(s: str) -> str:
     if not s:
         return ""
     t = s.strip()
-    t = re.sub(r"\bstat[-\s]?trak\b", "StatTrak™", t, flags=re.I)
+    # unify common variants
+    t = re.sub(r"\bstat[-\s]?trak\b", "StatTrak", t, flags=re.I)
     t = re.sub(r"\bfield\s*tested\b", "Field-Tested", t, flags=re.I)
-    t = re.sub(r"\s+", " ", t)
+    # remove special skin-site decorations
+    t = t.replace("★", " ")
+    t = t.replace("™", " ")
+    t = t.replace("|", " ")
+    # collapse non-alnum to spaces, lower, and squeeze spaces
+    t = re.sub(r"[^a-zA-Z0-9]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
     return t
+
+def key_eq(a: str, b: str) -> bool:
+    return normalize_name(a) == normalize_name(b)
+
+def key_contains(hay: str, needle: str) -> bool:
+    return normalize_name(needle) in normalize_name(hay)
 
 # ======= ONE SHARED HTTP CLIENT (HTTP/2) =======
 def make_client() -> httpx.AsyncClient:
@@ -161,7 +174,7 @@ async def read_items_from_sheet(client: httpx.AsyncClient) -> List[Dict[str, Any
 
 # ======= PRICE FETCHERS =======
 async def fetch_steam_price(client: httpx.AsyncClient, market_hash_name: str) -> Optional[float]:
-    name = normalize_name(market_hash_name)
+    name = market_hash_name  # Steam seems fine with the original text; it already worked for you
     params = {
         "appid": str(STEAM_APPID),
         "market_hash_name": name,
@@ -202,7 +215,6 @@ async def fetch_skinport_catalog(client: httpx.AsyncClient) -> List[Dict[str, An
                 if isinstance(data, list):
                     cache_set("skinport_catalog", data, ttl=3600)  # 1 hour
                     return data
-            # transient 5xx → brief backoff
             if 500 <= r.status_code < 600:
                 await asyncio.sleep(0.8 * (attempt + 1))
             else:
@@ -211,25 +223,27 @@ async def fetch_skinport_catalog(client: httpx.AsyncClient) -> List[Dict[str, An
             await asyncio.sleep(0.8 * (attempt + 1))
     return []
 
-def best_skinport_match(catalog: List[Dict[str, Any]], target_name: str) -> Optional[Dict[str, Any]]:
-    t = normalize_name(target_name).lower()
+def best_skinport_match(catalog: List[Dict[str, Any]], target_name: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    t = normalize_name(target_name)
+    # exact key match
     for item in catalog:
-        name1 = normalize_name(item.get("market_hash_name") or "").lower()
-        name2 = normalize_name(item.get("name") or "").lower()
-        if t == name1 or t == name2:
-            return item
+        n1 = normalize_name(item.get("market_hash_name") or "")
+        n2 = normalize_name(item.get("name") or "")
+        if t == n1 or t == n2:
+            return item, (item.get("market_hash_name") or item.get("name"))
+    # contains (looser)
     for item in catalog:
-        name1 = normalize_name(item.get("market_hash_name") or "").lower()
-        name2 = normalize_name(item.get("name") or "").lower()
-        if t in name1 or t in name2:
-            return item
-    return None
+        n1 = normalize_name(item.get("market_hash_name") or "")
+        n2 = normalize_name(item.get("name") or "")
+        if t in n1 or t in n2:
+            return item, (item.get("market_hash_name") or item.get("name"))
+    return None, None
 
 async def fetch_skinport_price(client: httpx.AsyncClient, name: str) -> Optional[float]:
     catalog = await fetch_skinport_catalog(client)
     if not catalog:
         return None
-    match = best_skinport_match(catalog, name)
+    match, _ = best_skinport_match(catalog, name)
     if not match:
         return None
     for k in ("price", "min_price", "market_price", "last_price", "mean_price", "median_price", "suggested_price"):
@@ -331,5 +345,14 @@ async def test_steam(name: str = Query(..., description="Exact market name, e.g.
 @app.get("/test_skinport")
 async def test_skinport(name: str = Query(..., description="Exact market name")):
     async with make_client() as client:
-        price = await fetch_skinport_price(client, name)
-        return {"name": name, "price": price, "currency": SKINPORT_CURRENCY}
+        catalog = await fetch_skinport_catalog(client)
+        match, matched_name = best_skinport_match(catalog, name)
+        price = None
+        if match:
+            for k in ("price", "min_price", "market_price", "last_price", "mean_price", "median_price", "suggested_price"):
+                if match.get(k) is not None:
+                    try:
+                        price = float(match[k]); break
+                    except Exception:
+                        pass
+        return {"query": name, "matched": matched_name, "price": price, "currency": SKINPORT_CURRENCY}
